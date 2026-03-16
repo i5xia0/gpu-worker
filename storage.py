@@ -5,17 +5,65 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Coroutine
 from urllib.parse import urlparse
 
+import aiohttp
 import boto3
 from aiohttp import ClientSession
 from botocore.config import Config as BotoConfig
+from botocore.exceptions import (
+    ClientError,
+    ConnectionClosedError,
+    EndpointConnectionError,
+)
 
 from config import JobRecord, ObjectStoreConfig, Settings, WorkerState, logger
 
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 1.0
+RETRY_MAX_DELAY = 15.0
+
+_RETRYABLE_HTTP_CODES = frozenset({408, 429, 500, 502, 503, 504})
+
 _download_locks: dict[str, asyncio.Lock] = {}
 _download_locks_guard = asyncio.Lock()
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    if isinstance(exc, aiohttp.ClientResponseError) and exc.status in _RETRYABLE_HTTP_CODES:
+        return True
+    if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError, OSError)):
+        return True
+    if isinstance(exc, (ConnectionClosedError, EndpointConnectionError)):
+        return True
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "") if hasattr(exc, "response") else ""
+        return code in ("RequestTimeout", "SlowDown", "InternalError", "ServiceUnavailable")
+    return False
+
+
+async def _retry(
+    fn: Callable[..., Coroutine],
+    *args,
+    label: str = "",
+    max_retries: int = MAX_RETRIES,
+) -> Any:
+    last_exc: BaseException | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return await fn(*args)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable_error(exc) or attempt == max_retries:
+                raise
+            delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_MAX_DELAY)
+            logger.warning(
+                "retry %d/%d %s: %s (wait %.1fs)",
+                attempt, max_retries, label, exc, delay,
+            )
+            await asyncio.sleep(delay)
+    raise last_exc  # type: ignore[misc]
 
 
 async def _get_file_lock(filename: str) -> asyncio.Lock:
@@ -117,7 +165,7 @@ def _replace_value(payload: Any, matcher, replacement: str) -> Any:
 # Download
 # ---------------------------------------------------------------------------
 
-async def _download_http(session: ClientSession, source_url: str, dest_path: Path) -> None:
+async def _download_http_once(session: ClientSession, source_url: str, dest_path: Path) -> None:
     tmp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
     try:
         async with session.get(source_url) as response:
@@ -134,6 +182,13 @@ async def _download_http(session: ClientSession, source_url: str, dest_path: Pat
         raise
 
 
+async def _download_http(session: ClientSession, source_url: str, dest_path: Path) -> None:
+    await _retry(
+        _download_http_once, session, source_url, dest_path,
+        label=f"http-download {source_url}",
+    )
+
+
 def _parse_object_store_url(raw_url: str, default_bucket: str) -> tuple[str, str]:
     parsed = urlparse(raw_url)
     bucket = parsed.netloc or default_bucket
@@ -143,16 +198,13 @@ def _parse_object_store_url(raw_url: str, default_bucket: str) -> tuple[str, str
     return bucket, key
 
 
-async def _download_s3(
+async def _download_s3_once(
     raw_url: str,
     dest_path: Path,
     s3_client,
-    object_store: ObjectStoreConfig,
+    bucket: str,
+    key: str,
 ) -> None:
-    if s3_client is None:
-        raise RuntimeError("R2 upload/download is not configured")
-
-    bucket, key = _parse_object_store_url(raw_url, object_store.bucket)
     tmp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
 
     def _stream_download() -> None:
@@ -167,6 +219,22 @@ async def _download_s3(
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
+
+
+async def _download_s3(
+    raw_url: str,
+    dest_path: Path,
+    s3_client,
+    object_store: ObjectStoreConfig,
+) -> None:
+    if s3_client is None:
+        raise RuntimeError("R2 upload/download is not configured")
+
+    bucket, key = _parse_object_store_url(raw_url, object_store.bucket)
+    await _retry(
+        _download_s3_once, raw_url, dest_path, s3_client, bucket, key,
+        label=f"s3-download {raw_url}",
+    )
 
 
 async def _ensure_asset(
@@ -273,6 +341,19 @@ async def prepare_assets(
 # Upload
 # ---------------------------------------------------------------------------
 
+async def _upload_once(
+    s3_client,
+    bucket: str,
+    key: str,
+    local_path: Path,
+) -> None:
+    def _put_object() -> None:
+        with local_path.open("rb") as file_obj:
+            s3_client.put_object(Bucket=bucket, Key=key, Body=file_obj)
+
+    await asyncio.to_thread(_put_object)
+
+
 async def upload_output_if_needed(
     state: WorkerState,
     item: dict[str, Any],
@@ -280,6 +361,10 @@ async def upload_output_if_needed(
 ) -> None:
     filename = item.get("filename")
     if not filename:
+        return
+
+    if filename in record.uploaded_urls:
+        logger.info("upload SKIP (already uploaded): %s", filename)
         return
 
     subfolder = item.get("subfolder") or ""
@@ -295,15 +380,15 @@ async def upload_output_if_needed(
     remote_filename = f"{ts}_{filename}"
     key = record.object_store.output_key(state.settings.node_id, remote_filename)
 
-    def _put_object() -> None:
-        with local_path.open("rb") as file_obj:
-            record.s3_client.put_object(
-                Bucket=record.object_store.bucket,
-                Key=key,
-                Body=file_obj,
-            )
+    await _retry(
+        _upload_once,
+        record.s3_client,
+        record.object_store.bucket,
+        key,
+        local_path,
+        label=f"s3-upload {filename}",
+    )
 
-    await asyncio.to_thread(_put_object)
     public_url = record.object_store.public_url(state.settings.node_id, remote_filename)
     if public_url:
         record.uploaded_urls[filename] = public_url
