@@ -26,6 +26,15 @@ http://<host>:8190
 {
   "client_id": "scheduler-client-id",
   "prompt": {},
+  "s3": {
+    "endpoint_url": "https://<account>.r2.cloudflarestorage.com",
+    "region": "auto",
+    "bucket_name": "ai-videos",
+    "access_key_id": "<access-key>",
+    "secret_access_key": "<secret-key>",
+    "public_base_url": "https://r2.example.com",
+    "path": "uploads"
+  },
   "input_assets": [
     {
       "url": "https://example.com/input.png",
@@ -43,6 +52,12 @@ http://<host>:8190
 - `filename`：落地文件名
 - `node_id`：要注入的 workflow 节点 ID
 - `input_name`：该节点的输入字段名
+- `s3` / `r2`：当前任务使用的对象存储配置，支持 `endpoint_url`、`region`、`bucket_name`、`access_key_id`、`secret_access_key`、`public_base_url`、`path`
+
+`s3` / `r2` 既可以放在顶层，也可以放在 `extra_data` 里。Worker 会按以下优先级取值：
+
+1. 当前请求中的 `s3` / `r2`
+2. 环境变量默认值（`R2_*`、`WORKER_OUTPUT_PREFIX`）
 
 如果没有提供 `node_id + input_name`，Worker 会尝试按以下占位值在整个 workflow 里做字符串替换：
 
@@ -59,7 +74,7 @@ http://<host>:8190
 Worker 在访问 `/history/{prompt_id}` 时，会把输出文件上传到：
 
 ```text
-<WORKER_OUTPUT_PREFIX>/<WORKER_NODE_ID>/<unix_timestamp>_<filename>
+<path>/<WORKER_NODE_ID>/<unix_timestamp>_<filename>
 ```
 
 例如：
@@ -68,7 +83,14 @@ Worker 在访问 `/history/{prompt_id}` 时，会把输出文件上传到：
 uploads/s3-g0/1709510400_ComfyUI_00001_.mp4
 ```
 
-要与现有调度端兼容，调度端拼接结果 URL 时使用的前缀必须和这个 key 前缀保持一致。
+其中：
+
+- `path` 优先取请求里的 `s3.path` / `r2.path`
+- 未传时回退到环境变量 `WORKER_OUTPUT_PREFIX`
+- 公网访问前缀优先取请求里的 `public_base_url`
+- 未传时回退到环境变量 `R2_PUBLIC_BASE_URL`
+
+要与现有调度端兼容，调度端拼接结果 URL 时使用的前缀必须和这个 key 前缀保持一致；如果 `scheduler` 已优先读取 `worker.uploaded_urls`，则可以直接使用 Worker 回传的最终 URL。
 
 ## 存储清理（独立脚本）
 
