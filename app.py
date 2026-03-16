@@ -18,6 +18,7 @@ from storage import (
 
 
 async def _proxy_json(request: web.Request, path: str) -> web.Response:
+    """透传 ComfyUI 的只读 JSON 接口（如 queue/system_stats）。"""
     state: WorkerState = request.app["state"]
     if state.http_session is None:
         raise web.HTTPServiceUnavailable(text="worker session not ready")
@@ -57,6 +58,7 @@ async def queue_status(request: web.Request) -> web.Response:
 
 
 async def prompt(request: web.Request) -> web.Response:
+    """接收上游任务，完成资产准备后转发到 ComfyUI /prompt。"""
     state: WorkerState = request.app["state"]
     if state.http_session is None:
         raise web.HTTPServiceUnavailable(text="worker session not ready")
@@ -71,6 +73,7 @@ async def prompt(request: web.Request) -> web.Response:
         or extra_data.pop("r2", None)
         or extra_data.pop("s3", None)
     )
+    # 请求体允许覆盖默认 R2/S3 配置；未提供时回退到环境变量。
     object_store = resolve_object_store_config(object_store_raw, state.settings)
     s3_client = build_s3_client(object_store)
     if extra_data:
@@ -135,6 +138,7 @@ async def prompt(request: web.Request) -> web.Response:
 
 
 async def history(request: web.Request) -> web.Response:
+    """读取 ComfyUI history，并在首次命中时执行输出上传与临时目录清理。"""
     state: WorkerState = request.app["state"]
     if state.http_session is None:
         raise web.HTTPServiceUnavailable(text="worker session not ready")
@@ -194,6 +198,7 @@ async def view_proxy(request: web.Request) -> web.StreamResponse:
 
 
 async def websocket_proxy(request: web.Request) -> web.WebSocketResponse:
+    """双向代理前端 <-> ComfyUI 的 WebSocket 事件流。"""
     state: WorkerState = request.app["state"]
     if state.http_session is None:
         raise web.HTTPServiceUnavailable(text="worker session not ready")

@@ -8,6 +8,7 @@ from typing import Any
 import aiohttp
 from aiohttp import ClientSession
 
+# 统一日志入口，便于容器环境直接收集 worker 输出。
 logging.basicConfig(
     level=os.getenv("WORKER_LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(message)s",
@@ -22,6 +23,7 @@ def _env(name: str, default: str = "") -> str:
 
 @dataclass(frozen=True)
 class ObjectStoreConfig:
+    """请求级/默认级对象存储配置。"""
     endpoint: str = ""
     region: str = "auto"
     bucket: str = ""
@@ -32,6 +34,7 @@ class ObjectStoreConfig:
 
     @property
     def uploads_enabled(self) -> bool:
+        # 仅当 endpoint + bucket + ak/sk 完整时才允许上传。
         return all(
             [
                 self.endpoint,
@@ -53,6 +56,7 @@ class ObjectStoreConfig:
 
 @dataclass
 class Settings:
+    """进程级全局配置（来自环境变量）。"""
     host: str = _env("WORKER_HOST", "0.0.0.0")
     port: int = int(_env("WORKER_PORT", "8190"))
     comfyui_base_url: str = _env("COMFYUI_BASE_URL", "http://127.0.0.1:8188").rstrip("/")
@@ -104,6 +108,7 @@ class Settings:
 
 @dataclass
 class JobRecord:
+    """单个 prompt 的运行态上下文。"""
     prompt_id: str
     client_id: str
     temp_id: str
@@ -116,6 +121,7 @@ class JobRecord:
 
 class WorkerState:
     def __init__(self, settings: Settings):
+        # jobs 保存 prompt_id -> JobRecord，用于 history 上传与清理阶段复用。
         self.settings = settings
         timeout = aiohttp.ClientTimeout(total=settings.request_timeout_seconds)
         self.http_session: ClientSession | None = None

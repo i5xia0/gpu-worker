@@ -31,6 +31,7 @@ _download_locks_guard = asyncio.Lock()
 
 
 def _is_retryable_error(exc: BaseException) -> bool:
+    """识别可重试的瞬时异常，避免对明确失败场景重复请求。"""
     if isinstance(exc, aiohttp.ClientResponseError) and exc.status in _RETRYABLE_HTTP_CODES:
         return True
     if isinstance(exc, (aiohttp.ClientConnectionError, asyncio.TimeoutError, OSError)):
@@ -49,6 +50,7 @@ async def _retry(
     label: str = "",
     max_retries: int = MAX_RETRIES,
 ) -> Any:
+    """统一重试入口：指数退避 + 上限延时。"""
     last_exc: BaseException | None = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -67,6 +69,7 @@ async def _retry(
 
 
 async def _get_file_lock(filename: str) -> asyncio.Lock:
+    # 同名资产在并发任务中只允许一个下载协程执行，避免重复下载/脏写。
     async with _download_locks_guard:
         if filename not in _download_locks:
             _download_locks[filename] = asyncio.Lock()
@@ -87,6 +90,7 @@ def _get_string(raw: Any, *keys: str) -> str:
 
 
 def resolve_object_store_config(raw: Any, settings: Settings) -> ObjectStoreConfig:
+    """将请求级配置与环境默认配置合并成最终对象存储配置。"""
     defaults = settings.default_object_store()
     return ObjectStoreConfig(
         endpoint=_get_string(raw, "endpoint", "endpoint_url", "r2_endpoint") or defaults.endpoint,
@@ -131,6 +135,7 @@ def build_s3_client(config: ObjectStoreConfig):
 
 
 def normalize_assets(raw_assets: Any) -> list[dict[str, Any]]:
+    """兼容 list/dict 两种上游资产格式，统一为 list[dict]。"""
     if raw_assets is None:
         return []
     if isinstance(raw_assets, list):
@@ -166,6 +171,7 @@ def _replace_value(payload: Any, matcher, replacement: str) -> Any:
 # ---------------------------------------------------------------------------
 
 async def _download_http_once(session: ClientSession, source_url: str, dest_path: Path) -> None:
+    # 先写入临时文件，再原子 rename，避免半成品命中缓存。
     tmp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
     try:
         async with session.get(source_url) as response:
@@ -274,6 +280,7 @@ async def prepare_assets(
     s3_client,
     object_store: ObjectStoreConfig,
 ) -> dict[str, Any]:
+    """下载并替换 prompt 里的输入引用，最终返回可直接提交到 ComfyUI 的 payload。"""
     prompt = copy.deepcopy(prompt_payload)
     input_dir = state.settings.input_root
     input_dir.mkdir(parents=True, exist_ok=True)
@@ -359,6 +366,7 @@ async def upload_output_if_needed(
     item: dict[str, Any],
     record: JobRecord,
 ) -> None:
+    """按需上传输出文件，并把公开 URL 回填到 job 记录。"""
     filename = item.get("filename")
     if not filename:
         return
@@ -395,6 +403,7 @@ async def upload_output_if_needed(
 
 
 def iter_output_items(history_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """从 history.outputs 中提取可上传的 output 类型媒体条目。"""
     results: list[dict[str, Any]] = []
     outputs = history_data.get("outputs")
     if not isinstance(outputs, dict):
@@ -414,6 +423,7 @@ def iter_output_items(history_data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 async def cleanup_job(record: JobRecord) -> None:
+    """异步清理单任务临时目录。"""
     def _cleanup() -> None:
         shutil.rmtree(record.temp_dir, ignore_errors=True)
 
