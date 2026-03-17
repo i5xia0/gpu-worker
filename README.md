@@ -69,6 +69,72 @@ http://<host>:8190
 输入文件默认直接缓存在 `media` 根目录，也就是 ComfyUI 的 input 根目录。
 当上游对同一个资源始终传递稳定文件名时，Worker 会先检查 `media/<filename>` 是否已存在，命中则跳过下载。
 
+## Workflow 节点内嵌 URL
+
+除了通过 `input_assets` 显式声明输入资源外，Worker 还支持**在 workflow 节点中直接填写完整 URL**。Worker 会在提交到 ComfyUI 前自动发现、下载并替换这些 URL。
+
+支持的 URL 协议：`http://`、`https://`、`s3://`、`r2://`。
+
+示例 — 节点直接写 URL：
+
+```json
+{
+  "prompt": {
+    "12": {
+      "class_type": "LoadImage",
+      "inputs": {
+        "image": "https://cdn.example.com/photos/input.jpg"
+      }
+    },
+    "15": {
+      "class_type": "LoadImage",
+      "inputs": {
+        "image": "r2://ai-videos/uploads/ref_photo.png"
+      }
+    }
+  }
+}
+```
+
+Worker 处理后，实际提交给 ComfyUI 的 `prompt` 会变成：
+
+```json
+{
+  "12": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "a1b2c3d4_input.jpg"
+    }
+  },
+  "15": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "e5f6a7b8_ref_photo.png"
+    }
+  }
+}
+```
+
+### 处理优先级
+
+1. **`input_assets`（显式声明）**：优先处理，使用调用方指定的 `filename` 和 `node_id + input_name` 定位
+2. **Workflow 内嵌 URL（自动发现）**：在 `input_assets` 处理完成后，递归扫描 `prompt` 中剩余的 URL 字符串进行下载替换
+3. 已被 `input_assets` 处理过的 URL 不会重复下载
+
+### 文件名策略
+
+内嵌 URL 的本地文件名格式为 `{hash8}_{basename}`，其中 `hash8` 是 URL 的 MD5 前 8 位。这确保：
+
+- **稳定性**：同一 URL 始终映射到同一文件名，可命中缓存
+- **防冲突**：不同 URL 即使 basename 相同也不会覆盖
+- **可读性**：文件名保留原始 basename，便于排查
+
+### 注意事项
+
+- 只有字符串值整体为 URL 时才会被识别，嵌在文本中的 URL 不受影响（如 prompt 文本 `"visit https://example.com"` 不会被替换）
+- `s3://` / `r2://` 形式的 URL 需要请求体中提供对应的 `s3` / `r2` 配置，或通过环境变量 `R2_*` 配置
+- 与 `input_assets` 共享相同的缓存目录、文件锁和重试策略
+
 ## 输出上传约定
 
 Worker 在访问 `/history/{prompt_id}` 时，会把输出文件上传到：
@@ -134,6 +200,65 @@ uploads/s3-g0/1709510400_ComfyUI_00001_.mp4
 等上传完成后，再返回完整的 ComfyUI history 结果以及 `worker.uploaded_urls`。
 
 要与现有调度端兼容，调度端拼接结果 URL 时使用的前缀必须和这个 key 前缀保持一致；如果 `scheduler` 已优先读取 `worker.uploaded_urls`，则可以直接使用 Worker 回传的最终 URL。
+
+## 日志与排查
+
+Worker 的日志级别由环境变量 `WORKER_LOG_LEVEL` 控制，默认 `INFO`，可设为 `DEBUG` 获取更详细输出。
+
+```bash
+WORKER_LOG_LEVEL=DEBUG
+```
+
+### 关键日志关键词
+
+在容器日志中搜索以下关键词即可快速定位流程状态：
+
+| 关键词 | 含义 |
+|--------|------|
+| `POST /prompt` | 收到提交请求，会打印 `client_id`、`input_assets` 数量、是否带 `s3` 配置 |
+| `prepare_assets: phase1` | 开始处理显式 `input_assets`，打印资产数量 |
+| `prepare_assets: phase2` | 开始扫描 workflow 内嵌 URL，打印发现的 URL 数量 |
+| `cache HIT` | 输入文件已存在，跳过下载 |
+| `cache MISS` | 输入文件不存在，开始下载 |
+| `downloaded` | 下载完成，打印文件名和大小 |
+| `assets prepared` | 全部输入准备完毕 |
+| `job registered` | 任务已注册，打印 `prompt_id` 和是否启用上传 |
+| `history:` | `/history` 请求处理状态，包含输出文件数量和上传任务状态 |
+| `upload START` | 开始上传单个文件，打印本地路径、bucket、remote key |
+| `upload DONE` | 单个文件上传成功，打印最终公网 URL |
+| `upload SKIP` | 文件上传跳过（已上传 / 未配置 / 文件不存在） |
+| `upload BATCH START` | 后台上传任务启动，打印待上传文件列表 |
+| `upload BATCH DONE` | 后台上传任务全部完成 |
+| `upload BATCH FAILED` | 后台上传任务出现异常 |
+| `s3 client: OK` | S3/R2 客户端初始化成功，打印 endpoint 和 bucket |
+| `s3 client: SKIP` | S3/R2 客户端未创建（配置缺失） |
+| `retry` | 下载或上传触发了重试 |
+
+### 排查示例
+
+确认请求是否到达 Worker：
+
+```bash
+docker logs comfyui-gpu-worker 2>&1 | grep "POST /prompt"
+```
+
+确认输入下载是否命中缓存：
+
+```bash
+docker logs comfyui-gpu-worker 2>&1 | grep -E "cache (HIT|MISS)"
+```
+
+确认输出上传是否完成：
+
+```bash
+docker logs comfyui-gpu-worker 2>&1 | grep -E "upload (START|DONE|SKIP|BATCH)"
+```
+
+查看某个 prompt 的完整流程：
+
+```bash
+docker logs comfyui-gpu-worker 2>&1 | grep "<prompt_id>"
+```
 
 ## 存储清理（独立脚本）
 

@@ -23,14 +23,20 @@ async def _run_output_uploads(
     prompt_id: str,
     items: list[dict],
 ) -> None:
+    filenames = [it.get("filename", "?") for it in items]
+    logger.info("upload BATCH START: prompt=%s files=%s", prompt_id, filenames)
     try:
         for item in items:
             item.setdefault("prompt_id", prompt_id)
             await upload_output_if_needed(state, item, record)
         record.uploads_completed = True
+        logger.info(
+            "upload BATCH DONE: prompt=%s uploaded_urls=%s",
+            prompt_id, list(record.uploaded_urls.keys()),
+        )
         await cleanup_job(record)
     except Exception:
-        logger.exception("failed to upload outputs for prompt %s", prompt_id)
+        logger.exception("upload BATCH FAILED: prompt=%s", prompt_id)
     finally:
         record.upload_task = None
 
@@ -108,6 +114,11 @@ async def prompt(request: web.Request) -> web.Response:
     if not isinstance(prompt_payload, dict):
         raise web.HTTPBadRequest(text="`prompt` must be an object")
 
+    logger.info(
+        "POST /prompt: client_id=%s input_assets=%d has_s3_config=%s nodes=%d",
+        client_id, len(input_assets), object_store_raw is not None, len(prompt_payload),
+    )
+
     temp_id = uuid.uuid4().hex
     temp_dir = state.settings.tmp_root / temp_id
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -124,6 +135,8 @@ async def prompt(request: web.Request) -> web.Response:
         shutil.rmtree(temp_dir, ignore_errors=True)
         logger.exception("failed to prepare assets")
         raise web.HTTPBadRequest(text=f"failed to prepare assets: {exc}") from exc
+
+    logger.info("assets prepared: client_id=%s resolved_nodes=%d", client_id, len(resolved_prompt))
 
     upstream_payload = dict(payload)
     upstream_payload["client_id"] = client_id
@@ -151,6 +164,10 @@ async def prompt(request: web.Request) -> web.Response:
                 object_store=object_store,
                 s3_client=s3_client,
             )
+        logger.info(
+            "job registered: prompt_id=%s client_id=%s uploads_enabled=%s",
+            prompt_id, client_id, object_store.uploads_enabled,
+        )
 
     return web.json_response(data)
 
@@ -176,18 +193,35 @@ async def history(request: web.Request) -> web.Response:
         async with state.jobs_lock:
             record = state.jobs.get(prompt_id)
 
+        if not record:
+            logger.debug("history: prompt=%s no job record found", prompt_id)
+
         if record and not record.uploads_completed:
             items = iter_output_items(history_data)
             uploads_required = bool(items) and record.object_store.uploads_enabled and record.s3_client is not None
+
+            logger.info(
+                "history: prompt=%s output_items=%d uploads_required=%s upload_task_running=%s",
+                prompt_id, len(items), uploads_required, record.upload_task is not None,
+            )
 
             if uploads_required:
                 if record.upload_task is None:
                     record.upload_task = asyncio.create_task(
                         _run_output_uploads(state, record, prompt_id, items)
                     )
+                    logger.info("history: prompt=%s upload task started", prompt_id)
+                else:
+                    logger.info("history: prompt=%s upload task still running", prompt_id)
                 return web.json_response({})
             if items:
                 record.uploads_completed = True
+
+        if record and record.uploads_completed:
+            logger.info(
+                "history: prompt=%s returning with uploaded_urls=%d",
+                prompt_id, len(record.uploaded_urls),
+            )
 
         if record:
             history_data["worker"] = {

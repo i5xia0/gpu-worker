@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import hashlib
 import os
 import shutil
 import time
@@ -121,8 +122,13 @@ def resolve_object_store_config(raw: Any, settings: Settings) -> ObjectStoreConf
 
 def build_s3_client(config: ObjectStoreConfig):
     if not config.uploads_enabled:
+        logger.info("s3 client: SKIP (uploads not configured)")
         return None
 
+    logger.info(
+        "s3 client: OK endpoint=%s bucket=%s public_base_url=%s",
+        config.endpoint, config.bucket, config.public_base_url or "(none)",
+    )
     session = boto3.session.Session()
     return session.client(
         "s3",
@@ -164,6 +170,46 @@ def _replace_value(payload: Any, matcher, replacement: str) -> Any:
     if isinstance(payload, str) and matcher(payload):
         return replacement
     return payload
+
+
+_URL_SCHEMES = ("http://", "https://", "s3://", "r2://")
+
+
+def _is_workflow_url(value: str) -> bool:
+    """值是完整可下载 URL 时返回 True；普通文本或相对路径不匹配。"""
+    return isinstance(value, str) and value.startswith(_URL_SCHEMES)
+
+
+def _collect_embedded_urls(data: Any) -> list[tuple[Any, str | int, str]]:
+    """递归扫描嵌套结构，返回 (parent_container, key_or_index, url) 三元组列表。"""
+    hits: list[tuple[Any, str | int, str]] = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, str) and _is_workflow_url(value):
+                hits.append((data, key, value))
+            elif isinstance(value, (dict, list)):
+                hits.extend(_collect_embedded_urls(value))
+    elif isinstance(data, list):
+        for idx, value in enumerate(data):
+            if isinstance(value, str) and _is_workflow_url(value):
+                hits.append((data, idx, value))
+            elif isinstance(value, (dict, list)):
+                hits.extend(_collect_embedded_urls(value))
+    return hits
+
+
+def _url_to_stable_filename(url: str) -> str:
+    """
+    基于 URL 生成稳定且不易冲突的本地文件名。
+    格式: {hash8}_{basename}；无有效 basename 时回退到 {hash8}.bin。
+    """
+    parsed = urlparse(url)
+    raw_basename = os.path.basename(parsed.path.rstrip("/")) if parsed.path else ""
+    url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+    if raw_basename:
+        safe = raw_basename.replace("\\", "_")
+        return f"{url_hash}_{safe}"
+    return f"{url_hash}.bin"
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +334,10 @@ async def prepare_assets(
     if state.http_session is None:
         raise RuntimeError("HTTP session not initialized")
 
+    # ---- Phase 1: 显式 input_assets ----
+    logger.info("prepare_assets: phase1 input_assets=%d", len(assets))
     download_tasks: list[tuple[str, str, dict[str, Any]]] = []
+    url_filename_map: dict[str, str] = {}
 
     for asset in assets:
         source_url = (
@@ -306,6 +355,7 @@ async def prepare_assets(
             or Path(urlparse(source_url).path).name
         )
         download_tasks.append((source_url, filename, asset))
+        url_filename_map[source_url] = filename
 
     if download_tasks:
         await asyncio.gather(
@@ -340,6 +390,33 @@ async def prepare_assets(
             placeholders = {filename}
 
         prompt = _replace_value(prompt, lambda value, ph=placeholders: value in ph, comfy_relative_path)
+
+    # ---- Phase 2: 扫描 prompt 内嵌 URL 并自动下载替换 ----
+    embedded = _collect_embedded_urls(prompt)
+    logger.info("prepare_assets: phase2 embedded_urls=%d", len(embedded))
+    if embedded:
+        new_downloads: dict[str, str] = {}
+        for _, _, url in embedded:
+            if url not in url_filename_map and url not in new_downloads:
+                new_downloads[url] = _url_to_stable_filename(url)
+
+        if new_downloads:
+            logger.info("prepare_assets: phase2 new_downloads=%d", len(new_downloads))
+            await asyncio.gather(
+                *[
+                    _ensure_asset(state, url, fname, input_dir, s3_client, object_store)
+                    for url, fname in new_downloads.items()
+                ]
+            )
+            url_filename_map.update(new_downloads)
+
+        for parent, key, url in embedded:
+            filename = url_filename_map.get(url)
+            if filename:
+                comfy_path = "/".join(
+                    part for part in [state.settings.input_prefix, filename] if part
+                )
+                parent[key] = comfy_path
 
     return prompt
 
@@ -382,11 +459,17 @@ async def upload_output_if_needed(
         return
 
     if not record.object_store.uploads_enabled or record.s3_client is None:
+        logger.info("upload SKIP (not configured): %s", filename)
         return
 
     ts = int(time.time())
     remote_filename = f"{ts}_{filename}"
     key = record.object_store.output_key(state.settings.node_id, remote_filename)
+
+    logger.info(
+        "upload START: %s → bucket=%s key=%s",
+        local_path, record.object_store.bucket, key,
+    )
 
     await _retry(
         _upload_once,
@@ -400,6 +483,9 @@ async def upload_output_if_needed(
     public_url = record.object_store.public_url(state.settings.node_id, remote_filename)
     if public_url:
         record.uploaded_urls[filename] = public_url
+        logger.info("upload DONE: %s → %s", filename, public_url)
+    else:
+        logger.info("upload DONE: %s (no public_base_url configured)", filename)
 
 
 def iter_output_items(history_data: dict[str, Any]) -> list[dict[str, Any]]:
