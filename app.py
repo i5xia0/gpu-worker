@@ -17,6 +17,24 @@ from storage import (
 )
 
 
+async def _run_output_uploads(
+    state: WorkerState,
+    record: JobRecord,
+    prompt_id: str,
+    items: list[dict],
+) -> None:
+    try:
+        for item in items:
+            item.setdefault("prompt_id", prompt_id)
+            await upload_output_if_needed(state, item, record)
+        record.uploads_completed = True
+        await cleanup_job(record)
+    except Exception:
+        logger.exception("failed to upload outputs for prompt %s", prompt_id)
+    finally:
+        record.upload_task = None
+
+
 async def _proxy_json(request: web.Request, path: str) -> web.Response:
     """透传 ComfyUI 的只读 JSON 接口（如 queue/system_stats）。"""
     state: WorkerState = request.app["state"]
@@ -160,14 +178,16 @@ async def history(request: web.Request) -> web.Response:
 
         if record and not record.uploads_completed:
             items = iter_output_items(history_data)
-            try:
-                for item in items:
-                    item.setdefault("prompt_id", prompt_id)
-                    await upload_output_if_needed(state, item, record)
+            uploads_required = bool(items) and record.object_store.uploads_enabled and record.s3_client is not None
+
+            if uploads_required:
+                if record.upload_task is None:
+                    record.upload_task = asyncio.create_task(
+                        _run_output_uploads(state, record, prompt_id, items)
+                    )
+                return web.json_response({})
+            if items:
                 record.uploads_completed = True
-                await cleanup_job(record)
-            except Exception:
-                logger.exception("failed to upload outputs for prompt %s", prompt_id)
 
         if record:
             history_data["worker"] = {

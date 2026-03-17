@@ -90,6 +90,49 @@ uploads/s3-g0/1709510400_ComfyUI_00001_.mp4
 - 公网访问前缀优先取请求里的 `public_base_url`
 - 未传时回退到环境变量 `R2_PUBLIC_BASE_URL`
 
+`/history/{prompt_id}` 的返回结构与 ComfyUI 基本一致，Worker 只会在任务命中时附加一个 `worker` 字段：
+
+```json
+{
+  "07520bca-43bd-4f7c-bf0b-d817d969c1d6": {
+    "outputs": {
+      "node_x": {
+        "images": [
+          {
+            "filename": "ComfyUI_00001_.png",
+            "subfolder": "",
+            "type": "output"
+          }
+        ]
+      }
+    },
+    "status": {
+      "status_str": "success"
+    },
+    "worker": {
+      "node_id": "s3-g0",
+      "uploaded_urls": {
+        "ComfyUI_00001_.png": "https://r2.example.com/uploads/s3-g0/1709510400_ComfyUI_00001_.png"
+      }
+    }
+  }
+}
+```
+
+说明：
+
+- `worker.node_id`：当前 Worker 节点标识（`WORKER_NODE_ID`）
+- `worker.uploaded_urls`：`原始输出文件名 -> 上传后公网 URL` 映射
+- 未命中 Worker 任务记录时，不会附加 `worker` 字段
+
+当任务配置了对象存储上传，且 ComfyUI 已产出可上传文件但 Worker 仍在后台上传时，`/history/{prompt_id}` 会先返回：
+
+```json
+{}
+```
+
+等上传完成后，再返回完整的 ComfyUI history 结果以及 `worker.uploaded_urls`。
+
 要与现有调度端兼容，调度端拼接结果 URL 时使用的前缀必须和这个 key 前缀保持一致；如果 `scheduler` 已优先读取 `worker.uploaded_urls`，则可以直接使用 Worker 回传的最终 URL。
 
 ## 存储清理（独立脚本）

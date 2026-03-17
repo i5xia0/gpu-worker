@@ -117,6 +117,7 @@ class JobRecord:
     s3_client: Any | None = None
     uploaded_urls: dict[str, str] = field(default_factory=dict)
     uploads_completed: bool = False
+    upload_task: asyncio.Task | None = None
 
 
 class WorkerState:
