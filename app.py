@@ -214,8 +214,11 @@ async def history(request: web.Request) -> web.Response:
                 else:
                     logger.info("history: prompt=%s upload task still running", prompt_id)
                 return web.json_response({})
-            if items:
-                record.uploads_completed = True
+
+            record.uploads_completed = True
+            if not items:
+                logger.info("history: prompt=%s no output items, marking completed", prompt_id)
+                await cleanup_job(record)
 
         if record and record.uploads_completed:
             logger.info(
