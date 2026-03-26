@@ -27,7 +27,7 @@ RETRY_MAX_DELAY = 15.0
 
 _RETRYABLE_HTTP_CODES = frozenset({408, 429, 500, 502, 503, 504})
 
-_download_locks: dict[str, asyncio.Lock] = {}
+_download_locks: dict[str, tuple[asyncio.Lock, int]] = {}
 _download_locks_guard = asyncio.Lock()
 
 
@@ -69,12 +69,49 @@ async def _retry(
     raise last_exc  # type: ignore[misc]
 
 
-async def _get_file_lock(filename: str) -> asyncio.Lock:
-    # 同名资产在并发任务中只允许一个下载协程执行，避免重复下载/脏写。
-    async with _download_locks_guard:
-        if filename not in _download_locks:
-            _download_locks[filename] = asyncio.Lock()
-        return _download_locks[filename]
+class _FileLock:
+    """引用计数文件锁，所有使用者释放后自动从全局表中移除。"""
+
+    def __init__(self, filename: str):
+        self._filename = filename
+        self._lock: asyncio.Lock | None = None
+        self._acquired = False
+
+    async def __aenter__(self) -> None:
+        async with _download_locks_guard:
+            if self._filename in _download_locks:
+                lock, refcount = _download_locks[self._filename]
+                _download_locks[self._filename] = (lock, refcount + 1)
+            else:
+                lock = asyncio.Lock()
+                _download_locks[self._filename] = (lock, 1)
+            self._lock = lock
+        try:
+            await self._lock.acquire()
+            self._acquired = True
+        except BaseException:
+            async with _download_locks_guard:
+                entry = _download_locks.get(self._filename)
+                if entry is not None:
+                    lock, refcount = entry
+                    if refcount <= 1:
+                        _download_locks.pop(self._filename, None)
+                    else:
+                        _download_locks[self._filename] = (lock, refcount - 1)
+            raise
+
+    async def __aexit__(self, *exc) -> None:
+        if not self._acquired or self._lock is None:
+            return
+        self._lock.release()
+        async with _download_locks_guard:
+            entry = _download_locks.get(self._filename)
+            if entry is not None:
+                lock, refcount = entry
+                if refcount <= 1:
+                    _download_locks.pop(self._filename, None)
+                else:
+                    _download_locks[self._filename] = (lock, refcount - 1)
 
 
 def _get_string(raw: Any, *keys: str) -> str:
@@ -303,8 +340,7 @@ async def _ensure_asset(
         logger.info("cache HIT: %s (skip download)", filename)
         return
 
-    lock = await _get_file_lock(filename)
-    async with lock:
+    async with _FileLock(filename):
         if dest_path.exists():
             logger.info("cache HIT (after lock): %s", filename)
             return

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import shutil
+import time
 import uuid
 
 from aiohttp import WSMsgType, web
@@ -30,6 +31,7 @@ async def _run_output_uploads(
             item.setdefault("prompt_id", prompt_id)
             await upload_output_if_needed(state, item, record)
         record.uploads_completed = True
+        record.completed_at = time.time()
         logger.info(
             "upload BATCH DONE: prompt=%s uploaded_urls=%s",
             prompt_id, list(record.uploaded_urls.keys()),
@@ -84,6 +86,7 @@ async def queue_status(request: web.Request) -> web.Response:
 async def prompt(request: web.Request) -> web.Response:
     """接收上游任务，完成资产准备后转发到 ComfyUI /prompt。"""
     state: WorkerState = request.app["state"]
+    await state.release_expired_jobs()
     if state.http_session is None:
         raise web.HTTPServiceUnavailable(text="worker session not ready")
 
@@ -175,6 +178,7 @@ async def prompt(request: web.Request) -> web.Response:
 async def history(request: web.Request) -> web.Response:
     """读取 ComfyUI history，并在首次命中时执行输出上传与临时目录清理。"""
     state: WorkerState = request.app["state"]
+    await state.release_expired_jobs()
     if state.http_session is None:
         raise web.HTTPServiceUnavailable(text="worker session not ready")
 
@@ -216,6 +220,7 @@ async def history(request: web.Request) -> web.Response:
                 return web.json_response({})
 
             record.uploads_completed = True
+            record.completed_at = time.time()
             if not items:
                 logger.info("history: prompt=%s no output items, marking completed", prompt_id)
                 await cleanup_job(record)
@@ -229,7 +234,7 @@ async def history(request: web.Request) -> web.Response:
         if record:
             history_data["worker"] = {
                 "node_id": state.settings.node_id,
-                "uploaded_urls": record.uploaded_urls,
+                "uploaded_urls": dict(record.uploaded_urls),
             }
 
     return web.json_response(history_payload)
@@ -297,14 +302,16 @@ async def websocket_proxy(request: web.Request) -> web.WebSocketResponse:
         asyncio.create_task(_relay_frontend()),
     ]
 
-    done, pending = await asyncio.wait(relay_tasks, return_when=asyncio.FIRST_COMPLETED)
-    for task in pending:
-        task.cancel()
-    for task in done:
-        task.result()
-
-    await backend_ws.close()
-    await frontend_ws.close()
+    try:
+        done, pending = await asyncio.wait(relay_tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        for task in done:
+            if task.exception() is not None:
+                logger.warning("ws relay error: %s", task.exception())
+    finally:
+        await backend_ws.close()
+        await frontend_ws.close()
     return frontend_ws
 
 
@@ -338,4 +345,6 @@ def create_app() -> web.Application:
 
 
 if __name__ == "__main__":
-    web.run_app(create_app(), host=Settings().host, port=Settings().port)
+    app = create_app()
+    settings: Settings = app["state"].settings
+    web.run_app(app, host=settings.host, port=settings.port)

@@ -199,6 +199,9 @@ uploads/s3-g0/1709510400_ComfyUI_00001_.mp4
 
 等上传完成后，再返回完整的 ComfyUI history 结果以及 `worker.uploaded_urls`。
 
+上传完成后，Worker 不会立刻删除内存中的任务记录，而是会继续保留一段时间，方便调度端或其他消费者重复查询同一个 `prompt_id` 时仍能拿到 `worker.uploaded_urls`。
+保留时长由环境变量 `WORKER_HISTORY_RETENTION_SECONDS` 控制，默认值为 `3600` 秒。
+
 要与现有调度端兼容，调度端拼接结果 URL 时使用的前缀必须和这个 key 前缀保持一致；如果 `scheduler` 已优先读取 `worker.uploaded_urls`，则可以直接使用 Worker 回传的最终 URL。
 
 ## 日志与排查

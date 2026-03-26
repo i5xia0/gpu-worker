@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,7 @@ class Settings:
     comfyui_base_url: str = _env("COMFYUI_BASE_URL", "http://127.0.0.1:18188").rstrip("/")
     node_id: str = _env("WORKER_NODE_ID", "cloud-gpu-1")
     request_timeout_seconds: int = int(_env("WORKER_REQUEST_TIMEOUT_SECONDS", "300"))
+    history_retention_seconds: int = int(_env("WORKER_HISTORY_RETENTION_SECONDS", "3600"))
     input_root: Path = Path(_env("WORKER_INPUT_ROOT", "/workspace/ComfyUI/input"))
     output_root: Path = Path(_env("WORKER_OUTPUT_ROOT", "/workspace/ComfyUI/output"))
     tmp_root: Path = Path(_env("WORKER_TMP_ROOT", "/tmp/comfyui-worker"))
@@ -117,6 +119,7 @@ class JobRecord:
     s3_client: Any | None = None
     uploaded_urls: dict[str, str] = field(default_factory=dict)
     uploads_completed: bool = False
+    completed_at: float | None = None
     upload_task: asyncio.Task | None = None
 
 
@@ -139,6 +142,20 @@ class WorkerState:
             self.settings.comfyui_base_url,
             self.settings.uploads_enabled,
         )
+
+    async def release_expired_jobs(self) -> None:
+        cutoff = time.time() - self.settings.history_retention_seconds
+        expired_prompt_ids: list[str] = []
+        async with self.jobs_lock:
+            for prompt_id, record in self.jobs.items():
+                if not record.uploads_completed or record.completed_at is None:
+                    continue
+                if record.completed_at <= cutoff:
+                    expired_prompt_ids.append(prompt_id)
+            for prompt_id in expired_prompt_ids:
+                self.jobs.pop(prompt_id, None)
+        if expired_prompt_ids:
+            logger.info("expired jobs released: count=%d", len(expired_prompt_ids))
 
     async def shutdown(self) -> None:
         if self.http_session is not None:
