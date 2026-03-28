@@ -6,6 +6,7 @@
 - `GET /history/{prompt_id}`
 - `GET /queue`
 - `GET /system_stats`
+- `GET /view?...`
 - `GET /ws?clientId=...`
 
 代理层会把请求转发到本机真实 `ComfyUI`，并在输入输出两端补上对象存储逻辑。
@@ -199,10 +200,29 @@ uploads/s3-g0/1709510400_ComfyUI_00001_.mp4
 
 等上传完成后，再返回完整的 ComfyUI history 结果以及 `worker.uploaded_urls`。
 
+**性能优化**：上传进行中时，Worker 会直接返回 `{}`，不再每次都向 ComfyUI 请求完整 history。上传完成后，Worker 会缓存 history 结果，后续轮询直接返回缓存。上传失败超过 3 次后，Worker 会标记任务为已完成（可能只含部分 URL），防止无限重试。
+
 上传完成后，Worker 不会立刻删除内存中的任务记录，而是会继续保留一段时间，方便调度端或其他消费者重复查询同一个 `prompt_id` 时仍能拿到 `worker.uploaded_urls`。
 保留时长由环境变量 `WORKER_HISTORY_RETENTION_SECONDS` 控制，默认值为 `3600` 秒。
 
 要与现有调度端兼容，调度端拼接结果 URL 时使用的前缀必须和这个 key 前缀保持一致；如果 `scheduler` 已优先读取 `worker.uploaded_urls`，则可以直接使用 Worker 回传的最终 URL。
+
+## WebSocket 代理
+
+`GET /ws?clientId=...` 提供 ComfyUI WebSocket 的双向代理。为减少传输开销，代理层会对 ComfyUI 发出的事件做过滤和裁剪：
+
+- **二进制帧（预览图）**：完全丢弃，不转发给上游。调度端通常不需要实时预览。
+- **事件字段裁剪**：只保留调度端实际消费的字段。例如 `executed` 事件会去掉 `output` 载荷，`execution_error` 会去掉 `current_inputs` / `current_outputs`。
+- **高频消息节流**：`crystools.monitor` 最多每 5 秒转发一次；`progress` 最多每 3 秒转发一次（最后一步始终转发）。
+- **生命周期事件**：`executing`、`executed`、`execution_start`、`execution_cached`、`execution_error`、`execution_success`、`execution_interrupted` 始终转发，并记录 INFO 日志。
+
+上游 -> ComfyUI 方向的消息保持透传，不做过滤。
+
+## 文件查看代理
+
+`GET /view?...` 会把请求透传到 ComfyUI 的 `/view`，用于读取 `input`、`output`、`temp` 等目录下的图片、视频和其他媒体文件。
+
+为避免大文件读取时把整个响应一次性加载到 Worker 内存中，`gpu-worker` 现在会对 `/view` 使用流式透传：一边从 ComfyUI 读取，一边回写给上游，同时保留常见响应头（如 `Content-Type`、`Content-Length`、`Content-Disposition`）。
 
 ## 日志与排查
 
@@ -232,7 +252,13 @@ WORKER_LOG_LEVEL=DEBUG
 | `upload SKIP` | 文件上传跳过（已上传 / 未配置 / 文件不存在） |
 | `upload BATCH START` | 后台上传任务启动，打印待上传文件列表 |
 | `upload BATCH DONE` | 后台上传任务全部完成 |
-| `upload BATCH FAILED` | 后台上传任务出现异常 |
+| `upload BATCH FAILED` | 后台上传任务出现异常（会显示当前重试次数） |
+| `upload BATCH FAILED permanently` | 上传重试达到上限，标记任务为已完成 |
+| `short-circuit` | 上传进行中，`/history` 请求被短路（未请求 ComfyUI） |
+| `returning cached result` | 上传完成后从缓存返回 history |
+| `ws open` | WebSocket 代理连接建立 |
+| `ws closed` | WebSocket 代理连接关闭 |
+| `ws event` | WebSocket 事件转发（生命周期事件为 INFO，其余为 DEBUG） |
 | `s3 client: OK` | S3/R2 客户端初始化成功，打印 endpoint 和 bucket |
 | `s3 client: SKIP` | S3/R2 客户端未创建（配置缺失） |
 | `retry` | 下载或上传触发了重试 |

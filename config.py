@@ -121,6 +121,8 @@ class JobRecord:
     uploads_completed: bool = False
     completed_at: float | None = None
     upload_task: asyncio.Task | None = None
+    cached_history: dict | None = field(default=None, repr=False)
+    upload_attempts: int = 0
 
 
 class WorkerState:
